@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docpipe</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 text-slate-800">
+<header class="bg-slate-900 text-white">
+  <div class="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-4">
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">docpipe</h1>
+      <p class="text-xs text-slate-400">Async document pipeline: upload, queue, retry, live status, webhooks</p>
+    </div>
+    <div id="health" class="flex flex-wrap gap-2 text-xs"></div>
+    <div class="flex gap-2">
+      <button id="btn-sweep" class="rounded-md bg-slate-700 px-3 py-1.5 text-sm hover:bg-slate-600">Run sweeper</button>
+      <button id="btn-replay" class="rounded-md bg-rose-600 px-3 py-1.5 text-sm hover:bg-rose-500">Replay dead letters</button>
+    </div>
+  </div>
+</header>
+
+<main class="mx-auto max-w-7xl space-y-4 px-4 py-4">
+  <section id="stats" class="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7"></section>
+
+  <div class="grid gap-4 lg:grid-cols-3">
+    <section class="space-y-4">
+      <div class="rounded-xl bg-white p-4 shadow-sm">
+        <h2 class="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-500">New job</h2>
+        <label id="drop" class="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-slate-300 p-6 text-center text-sm text-slate-500 hover:border-indigo-400 hover:bg-indigo-50">
+          <span id="drop-label">Drop a file here or click to choose</span>
+          <span class="mt-1 text-xs">.txt .csv .pdf .png .jpg (max 20 MB)</span>
+          <input id="file" type="file" class="hidden" accept=".txt,.md,.log,.csv,.pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp">
+        </label>
+        <label class="mt-3 block text-xs font-medium text-slate-600">Webhook URL (optional)</label>
+        <input id="webhook" type="url" placeholder="http://127.0.0.1:9100/ok" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none">
+        <button id="btn-submit" class="mt-3 w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50">Process file</button>
+        <ol id="steps" class="mt-3 space-y-1 text-xs text-slate-500"></ol>
+      </div>
+      <div class="rounded-xl bg-white p-4 text-sm shadow-sm">
+        <h2 class="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-500">How it works</h2>
+        <ol class="list-decimal space-y-1 pl-5 text-slate-600">
+          <li>The API creates a job row and returns a presigned upload URL.</li>
+          <li>Your browser uploads straight to object storage.</li>
+          <li>Start queues the job in RabbitMQ and returns 202.</li>
+          <li>A worker runs validate, parse (OCR if needed), extract, summarize.</li>
+          <li>Progress streams back live (Redis pub/sub and SSE).</li>
+          <li>Transient errors retry with backoff, then dead-letter.</li>
+          <li>An optional signed webhook announces the result.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="space-y-4 lg:col-span-2">
+      <div class="rounded-xl bg-white shadow-sm">
+        <h2 class="px-4 pt-4 text-sm font-semibold uppercase tracking-wide text-slate-500">Jobs</h2>
+        <div id="jobs" class="max-h-80 overflow-auto"></div>
+      </div>
+      <div id="detail" class="rounded-xl bg-white p-4 shadow-sm"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toast" class="hidden"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const COLORS = {
+  PENDING_UPLOAD: 'bg-slate-200 text-slate-700', PENDING: 'bg-slate-200 text-slate-700',
+  QUEUED: 'bg-amber-100 text-amber-800', PROCESSING: 'bg-blue-100 text-blue-800',
+  RETRYING: 'bg-orange-100 text-orange-800', COMPLETED: 'bg-emerald-100 text-emerald-800',
+  DELIVERED: 'bg-emerald-100 text-emerald-800', FAILED: 'bg-rose-100 text-rose-800',
+  llm: 'bg-indigo-100 text-indigo-800', extractive: 'bg-slate-200 text-slate-700',
+  'extractive-fallback': 'bg-amber-100 text-amber-800'
+};
+const STAGES = [['validate', 10], ['parse', 40], ['extract', 70], ['summarize', 100]];
+const badge = (s) => `<span class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${COLORS[s] || 'bg-slate-200 text-slate-700'}">${esc(s)}</span>`;
+let jobs = [], selected = null, source = null, current = null, log = [], file = null;
+
+function toast(msg, bad = false) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'fixed bottom-4 right-4 z-50 max-w-sm rounded-lg px-4 py-3 text-sm text-white shadow-lg ' + (bad ? 'bg-rose-600' : 'bg-slate-900');
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => t.classList.add('hidden'), 4500);
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let d = r.statusText;
+    try { const b = await r.json(); d = typeof b.detail === 'string' ? b.detail : JSON.stringify(b.detail); } catch (e) {}
+    throw new Error(d);
+  }
+  return r.json();
+}
+
+function ago(ts) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(ts)) / 1000));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  return Math.floor(s / 3600) + 'h ago';
+}
+
+function renderHealth(d) {
+  const names = ['database', 'redis', 'storage', 'broker'];
+  $('#health').innerHTML = names.map((n) => {
+    const ok = d && d.checks && d.checks[n];
+    return `<span class="rounded-full px-2 py-0.5 ${ok ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}">${n}</span>`;
+  }).join('');
+}
+
+function renderStats(st) {
+  const j = st.jobs || {}, q = st.queues || {};
+  const items = [
+    ['Queued', j.QUEUED ?? 0, 'text-amber-600'], ['Processing', j.PROCESSING ?? 0, 'text-blue-600'],
+    ['Retrying', j.RETRYING ?? 0, 'text-orange-600'], ['Completed', j.COMPLETED ?? 0, 'text-emerald-600'],
+    ['Failed', j.FAILED ?? 0, 'text-rose-600'], ['Queue depth', q.jobs ?? '?', 'text-slate-700'],
+    ['Dead letters', q['jobs.dead'] ?? '?', 'text-rose-700']
+  ];
+  $('#stats').innerHTML = items.map(([l, v, c]) =>
+    `<div class="rounded-xl bg-white p-3 shadow-sm"><div class="text-xs text-slate-500">${l}</div><div class="text-2xl font-semibold ${c}">${esc(v)}</div></div>`).join('');
+}
+
+function row(j) {
+  const bar = j.status === 'FAILED' ? 'bg-rose-500' : j.status === 'COMPLETED' ? 'bg-emerald-500' : 'bg-indigo-500';
+  return `<tr data-id="${esc(j.id)}" class="cursor-pointer border-t border-slate-100 hover:bg-slate-50 ${j.id === selected ? 'bg-indigo-50' : ''}">
+    <td class="px-3 py-2 font-medium">${esc(j.filename)}</td>
+    <td class="px-3 py-2">${badge(j.status)}</td>
+    <td class="px-3 py-2"><div class="h-1.5 w-24 rounded bg-slate-200"><div class="h-1.5 rounded ${bar}" style="width:${j.progress || 0}%"></div></div><div class="mt-0.5 text-xs text-slate-400">${esc(j.stage || '-')}</div></td>
+    <td class="px-3 py-2">${j.attempts}</td>
+    <td class="px-3 py-2">${j.webhook_status ? badge(j.webhook_status) : '<span class="text-slate-300">-</span>'}</td>
+    <td class="px-3 py-2 text-xs text-slate-500">${ago(j.created_at)}</td></tr>`;
+}
+
+function renderJobs() {
+  const el = $('#jobs');
+  if (!jobs.length) { el.innerHTML = '<p class="p-4 text-sm text-slate-400">No jobs yet. Upload a file to start.</p>'; return; }
+  el.innerHTML = `<table class="min-w-full text-left text-sm"><thead class="text-xs uppercase tracking-wide text-slate-500"><tr>
+    <th class="px-3 py-2">File</th><th class="px-3 py-2">Status</th><th class="px-3 py-2">Progress</th>
+    <th class="px-3 py-2">Tries</th><th class="px-3 py-2">Webhook</th><th class="px-3 py-2">Created</th></tr></thead>
+    <tbody>${jobs.map(row).join('')}</tbody></table>`;
+}
+
+function stepper(j) {
+  let active = false, failed = false;
+  return STAGES.map(([name, pa]) => {
+    const done = j.status === 'COMPLETED' || j.progress >= pa;
+    let cls = 'border-slate-300 text-slate-400', mark = '&nbsp;';
+    if (done) { cls = 'border-emerald-500 bg-emerald-50 text-emerald-700'; mark = 'done'; }
+    else if (j.status === 'FAILED' && !failed && j.stage === name) { failed = true; cls = 'border-rose-500 bg-rose-50 text-rose-700'; mark = 'failed'; }
+    else if (j.status === 'PROCESSING' && !active) { active = true; cls = 'border-blue-500 bg-blue-50 text-blue-700 animate-pulse'; mark = 'running'; }
+    return `<div class="flex-1 rounded-md border px-2 py-1.5 text-center text-xs ${cls}"><div class="font-medium">${name}</div><div>${mark}</div></div>`;
+  }).join('');
+}
+
+function chips(label, arr) {
+  if (!arr || !arr.length) return '';
+  return `<div class="mb-2"><div class="text-xs font-medium text-slate-500">${label}</div><div class="mt-1 flex flex-wrap gap-1">${arr.map((v) => `<span class="rounded bg-slate-100 px-2 py-0.5 font-mono text-xs">${esc(v)}</span>`).join('')}</div></div>`;
+}
+
+function renderDetail() {
+  const el = $('#detail'), j = current;
+  if (!j) { el.innerHTML = '<p class="text-sm text-slate-400">Select a job to see live progress, results and webhook status.</p>'; return; }
+  const dur = j.started_at && j.finished_at ? ((new Date(j.finished_at) - new Date(j.started_at)) / 1000).toFixed(1) + 's' : '-';
+  const r = j.result;
+  let result = '';
+  if (r) {
+    const f = r.fields || {};
+    result = `<div class="mt-4 grid gap-4 md:grid-cols-2">
+      <div><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Extracted fields</h3>
+        ${chips('Invoice numbers', f.invoice_numbers)}${chips('Amounts', f.amounts)}${chips('Dates', f.dates)}${chips('Emails', f.emails)}
+        <div class="mt-2 text-xs text-slate-500">Type: ${esc(r.kind)} | ${esc(r.size_bytes)} bytes | <span class="font-mono">${esc(JSON.stringify(r.stats))}</span></div></div>
+      <div><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Summary ${badge(r.summary_method)}</h3>
+        <p class="text-sm text-slate-700">${esc(r.summary)}</p>
+        <div class="mt-3 flex flex-wrap gap-2">${Object.keys(r.outputs || {}).map((n) =>
+          `<a target="_blank" class="rounded-md border border-slate-300 px-2 py-1 text-xs text-indigo-700 hover:bg-indigo-50" href="/jobs/${esc(j.id)}/download/${esc(n)}">Download ${esc(n)}</a>`).join('')}</div></div></div>`;
+  }
+  const hook = j.webhook_status ? `<div class="mt-3 text-sm">Webhook ${badge(j.webhook_status)} <span class="text-xs text-slate-500">${j.webhook_attempts} attempt(s)</span></div>` : '';
+  const err = j.error ? `<div class="mt-3 rounded-md bg-rose-50 p-2 text-xs text-rose-700"><b>${j.status === 'COMPLETED' ? '' : 'Last error: '}</b>${esc(j.error)}</div>` : '';
+  const logHtml = log.map((e) => `<div>${esc(e.t)} | ${esc(e.s)} | ${esc(e.stage || '-')} | ${e.p}% | try ${e.a}</div>`).join('');
+  el.innerHTML = `<div class="flex flex-wrap items-start justify-between gap-2">
+      <div><h2 class="text-lg font-semibold">${esc(j.filename)}</h2><div class="font-mono text-xs text-slate-400">${esc(j.id)}</div></div>
+      <div class="flex items-center gap-2">${badge(j.status)}
+        ${j.status === 'FAILED' ? '<button data-act="retry" class="rounded-md bg-indigo-600 px-3 py-1 text-xs text-white hover:bg-indigo-500">Retry</button>' : ''}
+        <button data-act="copy" class="rounded-md border border-slate-300 px-3 py-1 text-xs hover:bg-slate-50">Copy id</button></div></div>
+    <div class="mt-4 flex gap-2">${stepper(j)}</div>
+    <div class="mt-3 flex gap-6 text-xs text-slate-500"><span>Attempts: <b>${j.attempts}</b></span><span>Progress: <b>${j.progress}%</b></span><span>Duration: <b>${dur}</b></span></div>
+    ${err}${hook}${result}
+    <h3 class="mb-1 mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Live events</h3>
+    <div class="max-h-36 overflow-auto rounded-md bg-slate-900 p-2 font-mono text-xs text-slate-300">${logHtml || '<div class="text-slate-500">waiting for events...</div>'}</div>`;
+}
+
+function select(id) {
+  selected = id; log = [];
+  current = jobs.find((j) => j.id === id) || null;
+  if (source) { source.close(); source = null; }
+  renderDetail(); renderJobs();
+  source = new EventSource(`/jobs/${id}/events`);
+  source.addEventListener('status', (e) => {
+    const d = JSON.parse(e.data);
+    current = d;
+    log.push({ t: new Date().toLocaleTimeString(), s: d.status, stage: d.stage, p: d.progress, a: d.attempts });
+    const i = jobs.findIndex((j) => j.id === d.id);
+    if (i >= 0) jobs[i] = d;
+    renderDetail(); renderJobs();
+    if (d.status === 'COMPLETED' || d.status === 'FAILED') { source.close(); source = null; refresh(); }
+  });
+}
+
+async function refresh() {
+  try {
+    const [list, st] = await Promise.all([api('/jobs?limit=50'), api('/admin/stats')]);
+    jobs = list; renderStats(st); renderJobs();
+    if (selected && !source) { const j = jobs.find((x) => x.id === selected); if (j) { current = j; renderDetail(); } }
+  } catch (e) { /* server unreachable */ }
+}
+
+async function health() {
+  try { const r = await fetch('/readyz'); renderHealth(await r.json()); } catch (e) { renderHealth(null); }
+}
+
+function setFile(f) {
+  file = f || null;
+  $('#drop-label').textContent = file ? `${file.name} (${(file.size / 1024).toFixed(1)} KB)` : 'Drop a file here or click to choose';
+}
+
+const drop = $('#drop');
+['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('bg-indigo-50'); }));
+['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('bg-indigo-50'); }));
+drop.addEventListener('drop', (e) => setFile(e.dataTransfer.files[0]));
+$('#file').addEventListener('change', (e) => setFile(e.target.files[0]));
+
+$('#btn-submit').onclick = async () => {
+  if (!file) return toast('Choose a file first', true);
+  const btn = $('#btn-submit');
+  btn.disabled = true; $('#steps').innerHTML = '';
+  const step = (t) => $('#steps').insertAdjacentHTML('beforeend', `<li>&#10003; ${esc(t)}</li>`);
+  try {
+    const body = { filename: file.name, content_type: file.type || null };
+    const hook = $('#webhook').value.trim();
+    if (hook) body.webhook_url = hook;
+    const j = await api('/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    step('Job created, presigned URL received');
+    let put;
+    try { put = await fetch(j.upload_url, { method: 'PUT', body: file }); }
+    catch (e) { throw new Error('Upload blocked by the browser (storage CORS?). The job stays PENDING_UPLOAD.'); }
+    if (!put.ok) throw new Error('Storage rejected the upload: HTTP ' + put.status);
+    step('File uploaded directly to storage');
+    await api(`/jobs/${j.job_id}/start`, { method: 'POST' });
+    step('Job queued (202)');
+    await refresh(); select(j.job_id);
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
+};
+
+$('#btn-sweep').onclick = async () => {
+  try { const r = await api('/admin/sweep', { method: 'POST' }); toast(`Sweeper: requeued ${r.requeued}, recovered ${r.recovered}, webhooks ${r.webhooks}${r.skipped ? ' (skipped: backlog)' : ''}`); refresh(); }
+  catch (e) { toast(e.message, true); }
+};
+$('#btn-replay').onclick = async () => {
+  try { const r = await api('/admin/dead-letters/replay', { method: 'POST' }); toast(`Replayed ${r.replayed}, skipped ${r.skipped}`); refresh(); }
+  catch (e) { toast(e.message, true); }
+};
+$('#jobs').addEventListener('click', (e) => { const tr = e.target.closest('[data-id]'); if (tr) select(tr.dataset.id); });
+$('#detail').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-act]');
+  if (!b || !current) return;
+  if (b.dataset.act === 'copy') { navigator.clipboard.writeText(current.id); toast('Job id copied'); }
+  if (b.dataset.act === 'retry') {
+    try { await api(`/jobs/${current.id}/retry`, { method: 'POST' }); toast('Job re-queued'); select(current.id); refresh(); }
+    catch (err) { toast(err.message, true); }
+  }
+});
+
+renderDetail();
+setInterval(refresh, 3000); setInterval(health, 10000);
+refresh(); health();
+</script>
+</body>
+</html>
